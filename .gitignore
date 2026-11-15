@@ -1,0 +1,71 @@
+# ==========================================
+# Environment Variables & API Keys (DO NOT COMMIT)
+# ==========================================
+.env
+.env.*
+!.env.example
+*.env
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# ==========================================
+# Python & Bytecode
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# Virtual Environments
+# ==========================================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# Vector Stores & Local Databases
+# ==========================================
+chroma_db/
+*.sqlite3
+*.db
+
+# ==========================================
+# Testing & Code Coverage
+# ==========================================
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# ==========================================
+# IDE & Operating System Files
+# ==========================================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
