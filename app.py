@@ -1,11 +1,18 @@
 import os
+import importlib
 import streamlit as st
 from dotenv import load_dotenv
 
-from ingest import index_pdf_files, clear_knowledge_base, get_collection
-from rag import answer_question, generate_quiz, retrieve_relevant_chunks
+# Ensure environment variables are reloaded from .env on each run
+load_dotenv(override=True)
 
-load_dotenv()
+import ingest
+import rag
+importlib.reload(ingest)
+importlib.reload(rag)
+
+from ingest import index_pdf_files, clear_knowledge_base, get_collection
+from rag import answer_question, generate_quiz, retrieve_relevant_chunks, get_available_models
 
 st.set_page_config(
     page_title="StudyMate AI — Student Study Companion",
@@ -78,21 +85,27 @@ with st.sidebar:
     )
     api_key = api_key_input.strip() if api_key_input else None
 
-    # Model Selection
-    model_options = [
+    # Dynamic Model Selection
+    discovered_models = []
+    if api_key and len(api_key) > 10:
+        try:
+            discovered_models = get_available_models(api_key)
+        except Exception:
+            discovered_models = []
+
+    model_options = discovered_models if discovered_models else [
         "gemini-2.5-flash",
         "gemini-2.0-flash",
         "gemini-1.5-flash",
         "gemini-1.5-pro"
     ]
-    env_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    if env_model not in model_options:
-        model_options.insert(0, env_model)
+    env_model = os.environ.get("GEMINI_MODEL", model_options[0])
+    default_idx = model_options.index(env_model) if env_model in model_options else 0
     selected_model = st.selectbox(
         "Gemini Model",
         options=model_options,
-        index=model_options.index(env_model) if env_model in model_options else 0,
-        help="Select model variant. gemini-2.5-flash or gemini-2.0-flash is recommended."
+        index=default_idx,
+        help="Select the Gemini model variant. Dynamically populated based on your API key."
     )
 
     st.divider()
