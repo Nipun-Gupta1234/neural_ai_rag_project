@@ -1,5 +1,4 @@
 import os
-import uuid
 from typing import List, Dict, Any, Tuple
 import chromadb
 from chromadb.config import Settings as ChromaSettings
@@ -39,16 +38,15 @@ def extract_pdf_pages(file_bytes: bytes, doc_name: str) -> List[Dict[str, Any]]:
     preserving document name and exact 1-indexed page number.
     """
     pages_data = []
-    doc = pymupdf.open(stream=file_bytes, filetype="pdf")
-    for page_idx in range(len(doc)):
-        page = doc[page_idx]
-        text = page.get_text("text").strip()
-        if text:
-            pages_data.append({
-                "doc_name": doc_name,
-                "page_num": page_idx + 1,
-                "text": text
-            })
+    with pymupdf.open(stream=file_bytes, filetype="pdf") as doc:
+        for page_idx in range(len(doc)):
+            text = doc[page_idx].get_text("text").strip()
+            if text:
+                pages_data.append({
+                    "doc_name": doc_name,
+                    "page_num": page_idx + 1,
+                    "text": text
+                })
     return pages_data
 
 def chunk_pages(pages_data: List[Dict[str, Any]], chunk_size_words: int = 350, overlap_words: int = 50) -> List[Dict[str, Any]]:
@@ -63,7 +61,7 @@ def chunk_pages(pages_data: List[Dict[str, Any]], chunk_size_words: int = 350, o
         words = page["text"].split()
 
         if len(words) <= chunk_size_words:
-            chunk_id = f"{doc_name}_p{page_num}_c1_{uuid.uuid4().hex[:6]}"
+            chunk_id = f"{doc_name}_p{page_num}_c1"
             chunks.append({
                 "chunk_id": chunk_id,
                 "doc_name": doc_name,
@@ -76,7 +74,7 @@ def chunk_pages(pages_data: List[Dict[str, Any]], chunk_size_words: int = 350, o
             while start < len(words):
                 end = min(start + chunk_size_words, len(words))
                 sub_text = " ".join(words[start:end])
-                chunk_id = f"{doc_name}_p{page_num}_c{part}_{uuid.uuid4().hex[:6]}"
+                chunk_id = f"{doc_name}_p{page_num}_c{part}"
                 chunks.append({
                     "chunk_id": chunk_id,
                     "doc_name": doc_name,
@@ -96,6 +94,8 @@ def index_pdf_files(pdf_files: List[Tuple[str, bytes]], persist_dir: str = CHROM
     pdf_files: list of (doc_name, file_bytes)
     """
     collection = get_collection(persist_dir)
+    # Same file name selected twice would create duplicate chunk IDs; keep the last one
+    pdf_files = list(dict(pdf_files).items())
     total_pages = 0
     all_chunks = []
 
@@ -125,6 +125,11 @@ def index_pdf_files(pdf_files: List[Tuple[str, bytes]], persist_dir: str = CHROM
     # Generate embeddings with all-MiniLM-L6-v2
     model = get_embedding_model()
     embeddings = model.encode(texts, show_progress_bar=False, normalize_embeddings=True).tolist()
+
+    # Remove any chunks from an earlier upload of the same file, so re-indexing
+    # (or uploading an edited version) replaces it instead of adding duplicates.
+    for doc_name in {c["doc_name"] for c in all_chunks}:
+        collection.delete(where={"doc_name": doc_name})
 
     # Batch upsert into ChromaDB
     batch_size = 50

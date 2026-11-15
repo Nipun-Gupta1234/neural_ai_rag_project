@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 from ingest import get_collection, get_embedding_model
 
-load_dotenv(override=True)
+load_dotenv()
 
 SYSTEM_PROMPT = """You are StudyMate AI, an expert, encouraging, and accurate AI study tutor.
 Your job is to help students learn and understand their course materials based strictly on the provided study notes.
@@ -67,154 +67,116 @@ def format_context_for_prompt(chunks: List[Dict[str, Any]]) -> str:
         )
     return "\n".join(formatted)
 
-def get_available_models(api_key: Optional[str] = None) -> List[str]:
-    """
-    Fetches the actual list of available models for the given API key
-    using ModelService.ListModels.
-    """
-    effective_key = (api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
-    if not effective_key or effective_key == "your_gemini_api_key_here":
-        return []
+# Google retires model names over time (the "-latest" aliases were removed too),
+# so we keep a short list of known-good models and also fall back to whatever
+# the API key reports as available.
+DEFAULT_MODEL = "gemini-3.5-flash"
+FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash"]
 
-    # Try modern google.genai SDK across v1beta and v1
+
+def _is_model_not_found(exc: Exception) -> bool:
+    """True when the API rejected the model name (retired / unknown), not the key or quota."""
+    return getattr(exc, "code", None) == 404 or "404" in str(exc)
+
+
+def _is_model_overloaded(exc: Exception) -> bool:
+    """True for temporary 'high demand' errors where another model may still work."""
+    return getattr(exc, "code", None) == 503 or "503" in str(exc) or "UNAVAILABLE" in str(exc)
+
+
+def list_available_models(api_key: str) -> List[str]:
+    """
+    Returns the Gemini text models ("flash" / "pro") this API key can use,
+    newest version first. Returns [] if the list can't be fetched.
+    """
     try:
         from google import genai
-        from google.genai import types
-        for api_ver in ["v1beta", "v1"]:
-            try:
-                client = genai.Client(
-                    api_key=effective_key,
-                    http_options=types.HttpOptions(api_version=api_ver)
-                )
-                models = []
-                for m in client.models.list():
-                    actions = getattr(m, "supported_actions", []) or []
-                    if "generateContent" in actions or not actions:
-                        name = m.name.replace("models/", "") if m.name else ""
-                        if name and "gemini" in name.lower() and "embedding" not in name.lower():
-                            models.append(name)
-                if models:
-                    return models
-            except Exception:
-                continue
-    except Exception:
-        pass
+        client = genai.Client(api_key=api_key)
+        names = []
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or []
+            name = (m.name or "").removeprefix("models/")
+            is_text_model = ("flash" in name or "pro" in name) and not any(
+                skip in name for skip in ("image", "embedding", "tts", "audio", "live", "preview")
+            )
+            if "generateContent" in actions and name.startswith("gemini-") and is_text_model:
+                names.append(name)
 
-    # Fallback to legacy google.generativeai
-    try:
-        import google.generativeai as legacy_genai
-        legacy_genai.configure(api_key=effective_key)
-        models = []
-        for m in legacy_genai.list_models():
-            methods = getattr(m, "supported_generation_methods", []) or []
-            if "generateContent" in methods:
-                name = m.name.replace("models/", "") if m.name else ""
-                if name and "gemini" in name.lower() and "embedding" not in name.lower():
-                    models.append(name)
-        if models:
-            return models
-    except Exception:
-        pass
+        def version_key(n: str):
+            nums = re.findall(r"\d+", n)
+            return [int(x) for x in nums]
 
-    return []
+        return sorted(set(names), key=version_key, reverse=True)
+    except Exception:
+        return []
+
 
 def call_gemini_llm(
     prompt: str,
     api_key: Optional[str] = None,
     model_name: Optional[str] = None,
-    system_instruction: str = SYSTEM_PROMPT
+    system_instruction: str = SYSTEM_PROMPT,
+    json_output: bool = False
 ) -> str:
     """
-    Invokes the Gemini API dynamically discovering active models for the user's
-    API key and testing both v1beta and v1 endpoints to prevent 404 errors.
+    Calls Gemini through the google-genai SDK.
+
+    If the chosen model has been retired (HTTP 404) or is temporarily
+    overloaded (HTTP 503) it retries with fallback models, including the
+    ones the API key reports as available. Any other error (bad key, quota,
+    network) is raised immediately so the user sees the real cause.
     """
-    effective_key = (api_key or os.environ.get("GEMINI_API_KEY", "")).strip()
-    if not effective_key or effective_key == "your_gemini_api_key_here":
-        raise ValueError("Missing or placeholder Gemini API Key. Please enter your API key in the sidebar or .env file.")
+    effective_key = api_key or os.environ.get("GEMINI_API_KEY")
+    if not effective_key:
+        raise ValueError("Missing Gemini API Key. Please provide an API key.")
 
-    # 1. Query available models dynamically for this key
-    available_models = get_available_models(effective_key)
+    from google import genai
+    from google.genai import types
 
-    primary_model = (model_name or os.environ.get("GEMINI_MODEL", "")).strip()
-    
-    # Build candidate queue: user preference -> discovered models -> common defaults
-    candidate_models = []
-    if primary_model:
-        candidate_models.append(primary_model)
-    for m in available_models:
-        if m not in candidate_models:
-            candidate_models.append(m)
-    for fallback in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.0-pro"]:
-        if fallback not in candidate_models:
-            candidate_models.append(fallback)
+    primary_model = model_name or os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
+    candidate_models = [primary_model] + [m for m in FALLBACK_MODELS if m != primary_model]
 
-    last_error = None
+    client = genai.Client(api_key=effective_key)
+    listed_models_added = False
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=0.2,
+        response_mime_type="application/json" if json_output else None
+    )
 
-    # Try modern google.genai across both v1beta and v1 endpoints
-    try:
-        from google import genai
-        from google.genai import types
-
-        for api_ver in ["v1beta", "v1"]:
-            client = genai.Client(
-                api_key=effective_key,
-                http_options=types.HttpOptions(api_version=api_ver)
-            )
-            config = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.2
-            )
-
-            for cand in candidate_models:
-                try:
-                    response = client.models.generate_content(
-                        model=cand,
-                        contents=prompt,
-                        config=config
-                    )
-                    if response and response.text:
-                        return response.text.strip()
-                except Exception as e:
-                    last_error = e
-                    err_str = str(e).lower()
-                    if "404" in err_str or "not found" in err_str or "not supported" in err_str:
-                        continue
-                    # Non-404 errors (like auth, quota, billing) are fatal, re-raise immediately
-                    raise e
-    except Exception as e:
-        last_error = e
-
-    # Fallback: legacy google.generativeai
-    try:
-        import google.generativeai as legacy_genai
-        legacy_genai.configure(api_key=effective_key)
-        for cand in candidate_models:
-            try:
-                model = legacy_genai.GenerativeModel(
-                    model_name=cand,
-                    system_instruction=system_instruction
-                )
-                response = model.generate_content(prompt)
-                if response and response.text:
-                    return response.text.strip()
-            except Exception as e:
-                last_error = e
+    not_found_errors = []
+    overloaded_errors = []
+    i = 0
+    while i < len(candidate_models):
+        cand = candidate_models[i]
+        i += 1
+        try:
+            response = client.models.generate_content(model=cand, contents=prompt, config=config)
+        except Exception as e:
+            if _is_model_not_found(e) or _is_model_overloaded(e):
+                (not_found_errors if _is_model_not_found(e) else overloaded_errors).append(cand)
+                # Once the built-in list is exhausted, try the "flash" models this key can see.
+                if i == len(candidate_models) and not listed_models_added:
+                    listed_models_added = True
+                    extra = [m for m in list_available_models(effective_key)
+                             if "flash" in m and "image" not in m and m not in candidate_models]
+                    candidate_models.extend(extra[:5])
                 continue
-    except Exception as e:
-        last_error = e
+            raise
+        text = (response.text or "").strip() if response else ""
+        if not text:
+            raise RuntimeError(f"Gemini model '{cand}' returned an empty response (it may have been blocked by safety filters).")
+        return text
 
-    if last_error:
-        # Provide helpful diagnosis if all models returned 404
-        if "404" in str(last_error):
-            discovered_str = ", ".join(available_models) if available_models else "None"
-            raise RuntimeError(
-                f"None of the requested Gemini models were accessible on this API key (Available for your key: [{discovered_str}]). "
-                f"Please ensure the 'Generative Language API' is enabled in your Google Cloud / AI Studio project, "
-                f"or generate a new key at https://aistudio.google.com/."
-            )
-        raise last_error
-
-    raise RuntimeError("Failed to generate content with Gemini API.")
+    parts = []
+    if not_found_errors:
+        parts.append(f"not available to your API key: {', '.join(not_found_errors)}")
+    if overloaded_errors:
+        parts.append(f"temporarily overloaded (try again in a minute): {', '.join(overloaded_errors)}")
+    raise RuntimeError(
+        "No Gemini model could answer. Models " + "; ".join(parts) + ". "
+        "Pick a different model in the sidebar or set GEMINI_MODEL in .env."
+    )
 
 def get_gemini_model(api_key: Optional[str] = None, model_name: Optional[str] = None):
     """Backwards-compatibility stub."""
@@ -341,20 +303,44 @@ def generate_quiz(
         f"]"
     )
 
-    try:
-        raw_text = call_gemini_llm(
-            prompt=prompt,
-            api_key=effective_key,
-            model_name=model_name,
-            system_instruction=SYSTEM_PROMPT
-        )
+    raw_text = call_gemini_llm(
+        prompt=prompt,
+        api_key=effective_key,
+        model_name=model_name,
+        system_instruction=SYSTEM_PROMPT,
+        json_output=True
+    )
+    return parse_mcqs(raw_text)
 
-        # Clean code fences if present
-        raw_text = re.sub(r"^```(?:json)?", "", raw_text, flags=re.MULTILINE)
-        raw_text = re.sub(r"```$", "", raw_text, flags=re.MULTILINE).strip()
 
-        mcqs = json.loads(raw_text)
-        return mcqs
-    except Exception as e:
-        print(f"Error generating quiz: {e}")
-        return []
+def parse_mcqs(raw_text: str) -> List[Dict[str, Any]]:
+    """
+    Parses the model's JSON reply into a list of valid MCQs.
+    Questions missing a question, 4 options, or an A-D answer are dropped.
+    Raises ValueError if the reply contains no usable questions.
+    """
+    # Strip code fences in case the model added them anyway
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip())
+    # Fall back to the outermost [...] if there is extra text around the JSON
+    if not text.startswith("["):
+        match = re.search(r"\[.*\]", text, flags=re.DOTALL)
+        if match:
+            text = match.group(0)
+
+    data = json.loads(text)
+    if isinstance(data, dict):
+        data = data.get("questions", [data])
+
+    valid = []
+    for q in data if isinstance(data, list) else []:
+        if not isinstance(q, dict):
+            continue
+        options = q.get("options")
+        answer = str(q.get("answer", "")).strip()[:1].upper()
+        if q.get("question") and isinstance(options, list) and len(options) == 4 and answer in "ABCD" and answer:
+            q["answer"] = answer
+            valid.append(q)
+
+    if not valid:
+        raise ValueError("Gemini's reply did not contain any valid quiz questions.")
+    return valid

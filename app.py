@@ -1,18 +1,20 @@
 import os
-import importlib
 import streamlit as st
 from dotenv import load_dotenv
 
-# Ensure environment variables are reloaded from .env on each run
-load_dotenv(override=True)
-
-import ingest
-import rag
-importlib.reload(ingest)
-importlib.reload(rag)
-
 from ingest import index_pdf_files, clear_knowledge_base, get_collection
-from rag import answer_question, generate_quiz, retrieve_relevant_chunks, get_available_models
+from rag import (
+    answer_question, generate_quiz, retrieve_relevant_chunks,
+    list_available_models, DEFAULT_MODEL, FALLBACK_MODELS
+)
+
+load_dotenv()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_model_list(key: str):
+    """Fetches the models this key can use once an hour instead of on every rerun."""
+    return list_available_models(key)
 
 st.set_page_config(
     page_title="StudyMate AI — Student Study Companion",
@@ -85,27 +87,21 @@ with st.sidebar:
     )
     api_key = api_key_input.strip() if api_key_input else None
 
-    # Dynamic Model Selection
-    discovered_models = []
-    if api_key and len(api_key) > 10:
-        try:
-            discovered_models = get_available_models(api_key)
-        except Exception:
-            discovered_models = []
-
-    model_options = discovered_models if discovered_models else [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro"
-    ]
-    env_model = os.environ.get("GEMINI_MODEL", model_options[0])
-    default_idx = model_options.index(env_model) if env_model in model_options else 0
+    # Model Selection: known-good models first; models fetched live from the
+    # API are added below them.
+    model_options = list(FALLBACK_MODELS)
+    if api_key:
+        for m in cached_model_list(api_key):
+            if m not in model_options:
+                model_options.append(m)
+    env_model = os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
+    if env_model not in model_options:
+        model_options.insert(0, env_model)
     selected_model = st.selectbox(
         "Gemini Model",
         options=model_options,
-        index=default_idx,
-        help="Select the Gemini model variant. Dynamically populated based on your API key."
+        index=model_options.index(env_model),
+        help="gemini-3.5-flash is recommended. If a model is retired or busy, the app automatically tries others."
     )
 
     st.divider()
@@ -238,14 +234,16 @@ with tab2:
                 st.warning("Gemini API Key required to generate custom quizzes.")
             else:
                 with st.spinner("Analyzing notes and generating questions..."):
-                    mcqs = generate_quiz(topic_or_query=quiz_topic, api_key=api_key, model_name=selected_model, num_questions=5)
+                    try:
+                        mcqs = generate_quiz(topic_or_query=quiz_topic, api_key=api_key, model_name=selected_model, num_questions=5)
+                    except Exception as e:
+                        mcqs = []
+                        st.error(f"Could not generate quiz: {e}")
                     if mcqs:
                         st.session_state.quiz_data = mcqs
                         st.session_state.quiz_submitted = False
                         st.session_state.user_answers = {}
                         st.success("Quiz generated successfully!")
-                    else:
-                        st.error("Could not generate quiz. Please check API key and try again.")
 
     # Render Quiz
     if st.session_state.quiz_data:
@@ -261,6 +259,7 @@ with tab2:
                 choice = st.radio(
                     f"Select answer for Q{idx}:",
                     options=options,
+                    index=None,  # no pre-selected answer, so skipped questions count as wrong
                     key=f"q_choice_{idx}",
                     label_visibility="collapsed"
                 )

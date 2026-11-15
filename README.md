@@ -77,7 +77,7 @@ Copy-Item .env.example .env
 Edit `.env` and paste your Gemini API key:
 ```ini
 GEMINI_API_KEY=your_actual_key_here
-GEMINI_MODEL=gemini-1.5-flash
+GEMINI_MODEL=gemini-3.5-flash
 ```
 *(Alternatively, you can also paste your Gemini API key directly into the Streamlit sidebar field.)*
 
@@ -86,6 +86,13 @@ GEMINI_MODEL=gemini-1.5-flash
 streamlit run app.py
 ```
 The application will open automatically in your browser at `http://localhost:8501`.
+
+### Optional: Run the Automated Tests
+The tests use a temporary database (your indexed notes are not touched) and need no API key:
+```powershell
+pip install pytest
+pytest -v
+```
 
 ---
 
